@@ -1,8 +1,7 @@
-version: "3.7"
 services:
-  postgres:
+  mlflow_db:
     image: postgres:latest
-    container_name: postgres
+    container_name: mlflow_db
     restart: always
     ports:
       - "5432:5432"
@@ -11,16 +10,23 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DB}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mlflow_data:/var/lib/postgresql/data
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - mlflow_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   minio:
     restart: always
     image: quay.io/minio/minio
     container_name: minio
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "7010:9000"
+      - "7011:9001"
     environment:
       - MINIO_ROOT_USER=${MINIO_ACCESS_KEY}
       - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY}
@@ -28,11 +34,18 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
+    networks:
+      - mlflow_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   minio-setup:
+    restart: "no"
     image: quay.io/minio/mc
-    depends_on:
-      - minio
+    container_name: minio-setup
     volumes:
       - ./minio/create-bucket.sh:/create-bucket.sh
     entrypoint: /bin/sh
@@ -40,6 +53,11 @@ services:
     environment:
       - MINIO_ROOT_USER=${MINIO_ACCESS_KEY}
       - MINIO_ROOT_PASSWORD=${MINIO_SECRET_ACCESS_KEY}
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks:
+      - mlflow_net
 
   mlflow:
     restart: always
@@ -47,22 +65,109 @@ services:
     image: mlflow_server
     container_name: mlflow_server
     ports:
-      - "5001:5000"
+      - "7012:5000"
     environment:
       - AWS_ACCESS_KEY_ID=${MINIO_ACCESS_KEY}
       - AWS_SECRET_ACCESS_KEY=${MINIO_SECRET_ACCESS_KEY}
       - MLFLOW_S3_ENDPOINT_URL=${MLFLOW_S3_ENDPOINT}
       - MLFLOW_S3_IGNORE_TLS=true
+      - MLFLOW_TRACKING_USERNAME=${MLFLOW_TRACKING_USERNAME}
+      - MLFLOW_TRACKING_PASSWORD=${MLFLOW_TRACKING_PASSWORD}
     command: >
       mlflow server
-      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/mlflow
-      --host 0.0.0.0
+      --backend-store-uri postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@mlflow_db/mlflow
+      --host ${HOST}
       --serve-artifacts
       --artifacts-destination s3://mlflow
+      --app-name basic-auth
     depends_on:
-      - postgres
-      - minio-setup
+      mlflow_db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - mlflow_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.1.3
+    container_name: oauth2-proxy
+    expose:
+      - "7015"
+    ports:
+      - "7015:3000"
+    environment:
+      OAUTH2_PROXY_PROVIDER: google
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://accounts.google.com
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_CLIENT_ID: $OAUTH2_PROXY_CLIENT_ID
+      OAUTH2_PROXY_CLIENT_SECRET: $OAUTH2_PROXY_CLIENT_SECRET
+      OAUTH2_PROXY_COOKIE_SECRET: $OAUTH2_PROXY_COOKIE_SECRET
+      OAUTH2_PROXY_COOKIE_EXPIRE: 3h
+      OAUTH2_PROXY_COOKIE_REFRESH: 1h
+      OAUTH2_PROXY_UPSTREAMS: http://mlflow:5000
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:7015
+      OAUTH2_PROXY_REDIRECT_URL: http://127.0.0.1:7015/oauth2/callback
+      OAUTH2_PROXY_COOKIE_SECURE: "false"
+      OAUTH2_PROXY_SKIP_JWT_BEARER_TOKENS: "true"
+      OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "true"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "true"
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - mlflow_net
+    healthcheck:
+          test: ["CMD-SHELL", "curl -f http://localhost:3000 || exit 1"]
+          interval: 30s
+          timeout: 10s
+          retries: 5
+
+  mlflow_auth:
+    restart: "no"
+    build: ./mlflow_auth
+    image: mlflow_auth
+    container_name: mlflow_auth
+    depends_on:
+      mlflow:
+        condition: service_healthy
+  model_training:
+    restart: "no"
+    build: ./model_training
+    image: model_training
+    container_name: model_training
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - mlflow_net
+
+  anomaly_detection:
+    restart: "no"
+    build: ./anomaly_detection
+    image: anomaly_detection
+    container_name: anomaly_detection
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    networks:
+      - mlflow_net
 
 volumes:
-  postgres_data:
+  mlflow_data:
+    name: mlflow_data
   minio_data:
+    name: minio_data
+
+networks:
+  mlflow_net:
+    name: mlflow_net
+
